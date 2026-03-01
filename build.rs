@@ -1,19 +1,84 @@
-//! Build script: compile Telegram channel WASM from source.
+//! Build script for IronClaw
 //!
-//! Do not commit compiled WASM binaries — they are a supply chain risk.
-//! This script builds telegram.wasm from channels-src/telegram before the main crate compiles.
-//!
-//! Reproducible build:
-//!   cargo build --release
-//! (build.rs invokes the channel build automatically)
-//!
-//! Prerequisites: rustup target add wasm32-wasip2, cargo install wasm-tools
+//! This script validates the build target and embeds registry manifests.
+//! IronClaw is a host runtime and cannot be built for WASM targets.
 
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn main() {
+    // ── Validate build target (host runtime only) ─────────────────────────
+    let target = env::var("TARGET").expect("TARGET env var should be set by Cargo");
+
+    if target.starts_with("wasm32-") {
+        eprintln!(
+            "\n╔══════════════════════════════════════════════════════════════════════════════╗"
+        );
+        eprintln!(
+            "║                            BUILD ERROR                                       ║"
+        );
+        eprintln!(
+            "╠══════════════════════════════════════════════════════════════════════════════╣"
+        );
+        eprintln!(
+            "║  IronClaw is a HOST RUNTIME that runs on native operating systems.           ║"
+        );
+        eprintln!(
+            "║                                                                              ║"
+        );
+        eprintln!(
+            "║  It CANNOT be built for WASM targets like:                                   ║"
+        );
+        eprintln!(
+            "║    - wasm32-unknown-unknown                                                  ║"
+        );
+        eprintln!(
+            "║    - wasm32-wasip1                                                           ║"
+        );
+        eprintln!(
+            "║    - wasm32-wasip2                                                           ║"
+        );
+        eprintln!(
+            "║                                                                              ║"
+        );
+        eprintln!(
+            "║  The host runtime:                                                           ║"
+        );
+        eprintln!(
+            "║    - Loads and executes WASM strategy modules                                ║"
+        );
+        eprintln!(
+            "║    - Uses tokio, wasmtime, landlock, seccomp (native OS APIs)                ║"
+        );
+        eprintln!(
+            "║    - Requires an OS with errno support (Linux, macOS, Windows)               ║"
+        );
+        eprintln!(
+            "║                                                                              ║"
+        );
+        eprintln!(
+            "║  Correct build command:                                                      ║"
+        );
+        eprintln!(
+            "║    cargo build -p ironclaw                                                   ║"
+        );
+        eprintln!(
+            "║                                                                              ║"
+        );
+        eprintln!(
+            "║  If you need WASM strategy modules, build the channels separately:           ║"
+        );
+        eprintln!(
+            "║    ./channels-src/telegram/build.sh                                          ║"
+        );
+        eprintln!(
+            "╚══════════════════════════════════════════════════════════════════════════════╝\n"
+        );
+
+        panic!("IronClaw cannot be built for WASM target: {}", target);
+    }
+
     let manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
     let root = PathBuf::from(&manifest_dir);
 
@@ -111,25 +176,17 @@ fn main() {
 }
 
 /// Collect all registry manifests into a single JSON blob at compile time.
-///
-/// Output: `$OUT_DIR/embedded_catalog.json` with structure:
-/// ```json
-/// { "tools": [...], "channels": [...], "bundles": {...} }
-/// ```
 fn embed_registry_catalog(root: &Path) {
     use std::fs;
 
     let registry_dir = root.join("registry");
 
-    // Rerun if the bundles file changes (per-file watches for tools/channels
-    // are emitted inside collect_json_files to track content changes reliably).
     println!("cargo:rerun-if-changed=registry/_bundles.json");
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let out_path = out_dir.join("embedded_catalog.json");
 
     if !registry_dir.is_dir() {
-        // No registry dir: write empty catalog
         fs::write(
             &out_path,
             r#"{"tools":[],"channels":[],"bundles":{"bundles":{}}}"#,
@@ -141,19 +198,16 @@ fn embed_registry_catalog(root: &Path) {
     let mut tools = Vec::new();
     let mut channels = Vec::new();
 
-    // Collect tool manifests
     let tools_dir = registry_dir.join("tools");
     if tools_dir.is_dir() {
         collect_json_files(&tools_dir, &mut tools);
     }
 
-    // Collect channel manifests
     let channels_dir = registry_dir.join("channels");
     if channels_dir.is_dir() {
         collect_json_files(&channels_dir, &mut channels);
     }
 
-    // Read bundles
     let bundles_path = registry_dir.join("_bundles.json");
     let bundles_raw = if bundles_path.is_file() {
         fs::read_to_string(&bundles_path).unwrap_or_else(|_| r#"{"bundles":{}}"#.to_string())
@@ -161,7 +215,6 @@ fn embed_registry_catalog(root: &Path) {
         r#"{"bundles":{}}"#.to_string()
     };
 
-    // Build the combined JSON
     let catalog = format!(
         r#"{{"tools":[{}],"channels":[{}],"bundles":{}}}"#,
         tools.join(","),
@@ -184,11 +237,9 @@ fn collect_json_files(dir: &Path, out: &mut Vec<String>) {
         })
         .collect();
 
-    // Sort for deterministic output
     entries.sort_by_key(|e| e.file_name());
 
     for entry in entries {
-        // Emit per-file watch so Cargo reruns when file contents change
         println!("cargo:rerun-if-changed={}", entry.path().display());
         if let Ok(content) = fs::read_to_string(entry.path()) {
             out.push(content);
