@@ -42,7 +42,7 @@ IronClaw is the AI assistant you can actually trust with your personal and profe
 
 ### Security First
 
-- **WASM Sandbox** - Untrusted tools run in isolated WebAssembly containers with capability-based permissions
+- **WASM Sandbox** - Untrusted tools run in isolated WebAssembly containers with capability-based permissions (wasmtime 42.x + WASI Preview 1)
 - **Credential Protection** - Secrets are never exposed to tools; injected at the host boundary with leak detection
 - **Prompt Injection Defense** - Pattern detection, content sanitization, and policy enforcement
 - **Endpoint Allowlisting** - HTTP requests only to explicitly approved hosts and paths

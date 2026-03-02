@@ -10,16 +10,14 @@ use crate::sandbox::SandboxConfig;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use tracing::{info, warn};
 use wasmtime::{
-    Config as EngineConfig, Engine, Instance, Linker, Module, Store, StoreLimits,
-    StoreLimitsBuilder,
+    Config as EngineConfig, Engine, Linker, Module, Store, StoreLimits, StoreLimitsBuilder,
 };
-use wasmtime_wasi::preview2::{
-    pipe::MemoryOutputPipe, InputStream, WasiCtx, WasiCtxBuilder, WasiView,
-};
+use wasmtime_wasi::p1::{self, WasiP1Ctx};
+use wasmtime_wasi::p2::pipe::{MemoryInputPipe, MemoryOutputPipe};
+use wasmtime_wasi::{DirPerms, FilePerms, WasiCtxBuilder};
 
 /// Trading action types for strategy signals
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -149,8 +147,8 @@ pub trait StrategyRuntime: Send + Sync {
 
 /// WASI-compatible state for the wasmtime store
 struct WasmState {
-    /// WASI context for I/O operations
-    ctx: WasiCtx,
+    /// WASI Preview 1 context for I/O operations
+    ctx: WasiP1Ctx,
     /// Resource limits for the store
     limits: StoreLimits,
     /// Input data buffer for stdin
@@ -161,7 +159,7 @@ struct WasmState {
 
 impl WasmState {
     /// Creates a new WASI state with the given context and limits
-    fn new(ctx: WasiCtx, limits: StoreLimits) -> Self {
+    fn new(ctx: WasiP1Ctx, limits: StoreLimits) -> Self {
         Self {
             ctx,
             limits,
@@ -185,21 +183,12 @@ impl WasmState {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("No stdout buffer available"))?;
         let data = buffer
+            .clone()
             .try_into_inner()
-            .map_err(|_| anyhow::anyhow!("Failed to read stdout buffer"))?;
+            .ok_or_else(|| anyhow::anyhow!("Failed to read stdout buffer"))?;
         let result: T =
             serde_json::from_slice(&data).context("Failed to deserialize stdout data from JSON")?;
         Ok(result)
-    }
-}
-
-impl WasiView for WasmState {
-    fn table(&mut self) -> &mut wasmtime_wasi::preview2::ResourceTable {
-        self.ctx.table()
-    }
-
-    fn ctx(&mut self) -> &mut WasiCtx {
-        &mut self.ctx
     }
 }
 
@@ -239,9 +228,9 @@ impl WasmtimeRunner {
         // Configure engine with WASI Preview 2 support
         let mut config = EngineConfig::new();
         config.wasm_component_model(true);
-        config.async_support(false);
 
-        let engine = Engine::new(&config).context("Failed to create wasmtime engine")?;
+        let engine = Engine::new(&config)
+            .map_err(|e| anyhow::anyhow!("Failed to create wasmtime engine: {}", e))?;
 
         // Convert MB to bytes for store limits
         let max_memory_bytes = sandbox_config.max_memory_mb * 1024 * 1024;
@@ -270,7 +259,7 @@ impl WasmtimeRunner {
     ///
     /// Sets up stdin/stdout redirection, resource limits, and filesystem
     /// restrictions based on the sandbox configuration.
-    fn apply_sandbox<T: Serialize>(&self, data: &T) -> Result<WasiCtx> {
+    fn apply_sandbox<T: Serialize>(&self, data: &T) -> Result<WasiP1Ctx> {
         info!("Applying sandbox configuration for WASM execution");
 
         // Serialize input data for stdin
@@ -278,13 +267,12 @@ impl WasmtimeRunner {
             .context("Failed to serialize input data for WASM execution")?;
 
         // Create stdin stream from serialized data
-        let stdin: Box<dyn InputStream> = Box::new(
-            wasmtime_wasi::preview2::pipe::MemoryInputPipe::new(stdin_data),
-        );
+        let stdin = MemoryInputPipe::new(stdin_data);
 
         // Create stdout buffer for capturing output
         let stdout = MemoryOutputPipe::new(1024 * 1024); // 1MB buffer
 
+        // Security-first minimal WASI surface: no network, controlled preopens only
         let mut builder = WasiCtxBuilder::new();
 
         // Configure stdin/stdout
@@ -296,14 +284,7 @@ impl WasmtimeRunner {
             let path_str = path
                 .to_str()
                 .ok_or_else(|| anyhow::anyhow!("Invalid path encoding: {:?}", path))?;
-            builder
-                .preopened_dir(
-                    path,
-                    path_str,
-                    wasmtime_wasi::DirPerms::READ,
-                    wasmtime_wasi::FilePerms::READ,
-                )
-                .with_context(|| format!("Failed to preopen directory: {:?}", path))?;
+            builder.preopened_dir(path, path_str, DirPerms::READ, FilePerms::READ)?;
             info!(path = %path_str, "Added preopened directory for read-only access");
         }
 
@@ -312,7 +293,9 @@ impl WasmtimeRunner {
             info!("Network access disabled in sandbox");
         }
 
-        Ok(builder.build())
+        // Build the WASI Preview 1 context
+        let wasi_ctx: WasiP1Ctx = builder.build_p1();
+        Ok(wasi_ctx)
     }
 
     /// Executes the loaded WASM module with the given input data
@@ -337,33 +320,38 @@ impl WasmtimeRunner {
         let wasi_ctx = self.apply_sandbox(data)?;
 
         // Create store with limits
-        let mut state = WasmState::new(wasi_ctx, self.store_limits.clone());
+        let state = WasmState::new(wasi_ctx, self.store_limits.clone());
         let mut store = Store::new(&self.engine, state);
 
         // Set store limits for resource tracking
         store.limiter(|state| &mut state.limits);
 
-        // Create linker and add WASI Preview 2
+        // Create linker and add WASI Preview 1
         let mut linker = Linker::<WasmState>::new(&self.engine);
-        wasmtime_wasi::preview2::command::add_to_linker(&mut linker)
-            .context("Failed to add WASI Preview 2 to linker")?;
+        p1::add_to_linker_sync(&mut linker, |state: &mut WasmState| &mut state.ctx)
+            .map_err(|e| anyhow::anyhow!("Failed to add WASI Preview 1 to linker: {}", e))?;
 
         // Instantiate the module
         let instance = linker
             .instantiate(&mut store, module)
-            .context("Failed to instantiate WASM module")?;
+            .map_err(|e| anyhow::anyhow!("Failed to instantiate WASM module: {}", e))?;
 
         // Get the main function and execute
         let main_func = instance
             .get_typed_func::<(), ()>(&mut store, "_start")
             .or_else(|_| instance.get_typed_func::<(), ()>(&mut store, "main"))
-            .context("Failed to find entry point function (_start or main)")?;
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to find entry point function (_start or main): {}",
+                    e
+                )
+            })?;
 
         // Track execution time
         let start_time = Instant::now();
 
         // Execute with timeout if configured
-        let result = main_func
+        let _result = main_func
             .call(&mut store, ())
             .map_err(|e| anyhow::anyhow!("WASM execution failed: {}", e))?;
 
@@ -381,8 +369,9 @@ impl WasmtimeRunner {
             .ok_or_else(|| anyhow::anyhow!("No stdout buffer available after execution"))?;
 
         let output_data = stdout_buffer
+            .clone()
             .try_into_inner()
-            .map_err(|_| anyhow::anyhow!("Failed to read stdout buffer"))?;
+            .ok_or_else(|| anyhow::anyhow!("Failed to read stdout buffer"))?;
 
         if output_data.is_empty() {
             anyhow::bail!("WASM module produced no output");
@@ -413,8 +402,13 @@ impl StrategyRuntime for WasmtimeRunner {
         }
 
         // Load and compile the module
-        let module = Module::from_file(&self.engine, wasm_path)
-            .with_context(|| format!("Failed to load WASM module from: {}", wasm_path.display()))?;
+        let module = Module::from_file(&self.engine, wasm_path).map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to load WASM module from: {}: {}",
+                wasm_path.display(),
+                e
+            )
+        })?;
 
         info!(
             name = module.name().unwrap_or("unnamed"),

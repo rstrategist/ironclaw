@@ -2,20 +2,20 @@
 name = "ironclaw"
 version = "0.1.0"
 edition = "2021"
+description = "IronClaw: Security-first WASI sandbox for QuantTrader WASM skills"
 publish = false
 
 [dependencies]
 wasmtime = { workspace = true }
-wasmtime-wasi = { workspace = true }
+wasmtime-wasi = { workspace = true, default-features = false, features = [
+    "p1",
+] }
 anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+
 landlock = { workspace = true, optional = true }
 seccomp = { workspace = true, optional = true }
 which = "7"
 libc = "0.2"
-
-[features]
-default = ["host-sandbox"]
-host-sandbox = ["dep:landlock", "dep:seccomp"]
